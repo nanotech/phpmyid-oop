@@ -1,0 +1,1 @@
+echo 'username:password:name.tld' | openssl md5
