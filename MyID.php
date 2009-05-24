@@ -24,7 +24,6 @@ class PhpMyID {
 
 	/**
 	 * List the known types and modes
-	 * @name $known
 	 */
 	private static $known = array(
 		'assoc_types'	=> array('HMAC-SHA1'),
@@ -51,26 +50,26 @@ class PhpMyID {
 	/**
 	 * Defined by OpenID spec
 	 */
-	private static $g = 2;
+	const G = 2;
 
 	/**
 	 * Defined by OpenID spec
 	 */
-	private static $p = '155172898181473697471232257763715539915724801966915404479707795314057629378541917580651227423698188993727816152646631438561595825688188889951272158842675419950341258706556549803580104870537681476726513255747040765857479291291572334510643245094715007229621094194349783925984760375594985848253359305585439638443';
+	const P = '155172898181473697471232257763715539915724801966915404479707795314057629378541917580651227423698188993727816152646631438561595825688188889951272158842675419950341258706556549803580104870537681476726513255747040765857479291291572334510643245094715007229621094194349783925984760375594985848253359305585439638443';
 
-	private $charset = 'iso-8859-1';
-	private $profile;
+	private $charset = 'utf-8';
+	private $profile = array();
+	private $optional_headers = array();
 	private $sreg;
+	private $authorized = false;
+	private $realm;
+	private $req_url;
+	private $use_bigmath;
 
 	/*
 	 * App Initialization
 	 */
 	public function __construct($profile, $sreg=array()) {
-
-		$this->profile = $profile;
-		$this->sreg = $sreg;
-
-		$this->debug('==================================');
 
 		// Set the internal encoding
 		if (function_exists('mb_internal_encoding')) {
@@ -81,114 +80,103 @@ class PhpMyID {
 		// Credit for this goes to user 'prelog' on the forums
 		ini_set('arg_separator.output', '&');
 
-		// Do a check to be sure everything is set up correctly
-		$this->self_check();
+		// Ensure that we start off unauthorized
+		$this->authorized = false;
 
-		/**
-		 * Determine the HTTP request port
-		 */
-		$port = ((isset($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] == 'on' && $_SERVER['SERVER_PORT'] == 443)
-			  || $_SERVER['SERVER_PORT'] == 80)
-				? ''
-				: ':' . $_SERVER['SERVER_PORT'];
+		$port = $_SERVER['SERVER_PORT'];
+		$https = (isset($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] == 'on');
 
-		/**
-		 * Determine the HTTP request protocol
-		 */
-		$proto = (isset($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] == 'on') ? 'https' : 'http';
+		// Don't display default ports
+		$port_string = (($https && $port == 443) || $port == 80) ? '' : ':' . $port;
 
-		// Set the authorization state - DO NOT OVERRIDE
-		$this->profile['authorized'] = false;
+		$protocol = $https ? 'https' : 'http';
+		$url_format = $protocol . '://' . '%s'. $port_string . '%s';
 
-		// Set a default IDP URL
-		if (!array_key_exists('idp_url', $this->profile)) {
-			$this->profile['idp_url'] = sprintf(
-				"%s://%s%s%s",
-				$proto,
-				$_SERVER['SERVER_NAME'],
-				$port,
-				$_SERVER['PHP_SELF']
-			);
-		}
-
-		// Determine the requested URL - DO NOT OVERRIDE
-		$this->profile['req_url'] = sprintf(
-			"%s://%s%s%s",
-			$proto,
+		// Determine the requested URL
+		$this->req_url = sprintf(
+			$url_format,
 			$_SERVER['HTTP_HOST'],
-			$port,
-			$_SERVER["REQUEST_URI"]
+			$_SERVER['REQUEST_URI']
 		);
 
-		// Set the default allowance for testing
-		if (! array_key_exists('allow_test', $this->profile))
-			$this->profile['allow_test'] = false;
+		$session_life = session_cache_expire() * 60;
+		$gc_life = ini_get('session.gc_maxlifetime');
 
-		// Set the default allowance for gmp
-		if (! array_key_exists('allow_gmp', $this->profile))
-			$this->profile['allow_gmp'] = false;
+		$idp_path = $_SERVER['PHP_SELF'];
 
-		// Set the default force bigmath - BAD IDEA to override this
-		if (! array_key_exists('force_bigmath', $this->profile))
-			$this->profile['force_bigmath'] = false;
+		// Hide the default index filename (such as "index.php") from the IDP url.
+		if (strpos($_SERVER['REQUEST_URI'], basename($idp_path)) === false) {
+			$idp_path = dirname($idp_path);
+		}
+
+		// Set defaults
+		$this->profile = array(
+			'allow_test' => false,
+			'allow_gmp' => false,
+			'force_bigmath' => false, // BAD IDEA to override this
+			'auth_realm' => 'phpMyID',
+			'idp_url' => sprintf(
+				$url_format,
+				$_SERVER['SERVER_NAME'],
+				$idp_path
+			),
+			'lifetime' => min($session_life, $gc_life),
+		);
+
+		//
+		// Load user-set values
+		//
+		$this->profile = array_merge($this->profile, $profile);
+		$this->sreg = $sreg;
+
+		// Determine the realm for digest authentication
+		$this->realm = $this->profile['auth_realm'] . (ini_get('safe_mode') ? '-' . getmyuid() : '');
 
 		// Determine if GMP is usable
-		$this->profile['use_gmp'] = (extension_loaded('gmp') && $this->profile['allow_gmp']) ? true : false;
+		$this->profile['use_gmp'] = (extension_loaded('gmp') && $this->profile['allow_gmp']);
 
-		// Determine if I can perform big math functions
-		$this->profile['use_bigmath'] = (extension_loaded('bcmath') || $this->profile['use_gmp'] || $this->profile['force_bigmath']) ? true : false;
+		// Determine if we should use big math functions
+		$this->use_bigmath = (extension_loaded('bcmath') || $this->profile['use_gmp'] || $this->profile['force_bigmath']);
 
 		// Set a default authentication domain
-		if (! array_key_exists('auth_domain', $this->profile))
-			$this->profile['auth_domain'] = $this->profile['req_url'] . ' ' . $this->profile['idp_url'];
-
-		// Set a default authentication realm
-		if (! array_key_exists('auth_realm', $this->profile))
-			$this->profile['auth_realm'] = 'phpMyID';
-
-		// Determine the realm for digest authentication - DO NOT OVERRIDE
-		$this->profile['php_realm'] = $this->profile['auth_realm'] . (ini_get('safe_mode') ? '-' . getmyuid() : '');
-
-		// Set a default lifetime - the lesser of GC and cache time
-		if (! array_key_exists('lifetime', $this->profile)) {
-			$sce = session_cache_expire() * 60;
-			$gcm = ini_get('session.gc_maxlifetime');
-			$this->profile['lifetime'] = $sce < $gcm ? $sce : $gcm;
+		if (!isset($this->profile['auth_domain'])) {
+			$this->profile['auth_domain'] = $this->req_url . ' ' . $this->profile['idp_url'];
 		}
 
 		// Set a default log file
-		if (!array_key_exists('logfile', $this->profile)) {
+		if (!isset($this->profile['logfile'])) {
 			$this->profile['logfile'] = sys_get_temp_dir() . DIRECTORY_SEPARATOR . $this->profile['auth_realm'] . '.debug.log';
 		}
+
+		// Do a check to be sure everything is set up correctly
+		$this->self_check();
 
 		/*
 		 * Optional Initialization
 		 */
-		// Setup optional headers
-		$this->profile['opt_headers'] = array();
 
 		// Determine if I should add microid stuff
-		if (array_key_exists('microid', $this->profile)) {
+		if (isset($this->profile['microid'])) {
 			$hash = sha1($this->profile['idp_url']);
 			$values = is_array($this->profile['microid']) ? $this->profile['microid'] : array($this->profile['microid']);
 
 			foreach ($values as $microid) {
 				preg_match('/^([a-z]+)/i', $microid, $mtx);
-				$this->profile['opt_headers'][] = sprintf('<meta name="microid" content="%s+%s:sha1:%s" />', $mtx[1], $proto, sha1(sha1($microid) . $hash));
+				$this->optional_headers[] = 
+					"<meta name='microid' content='{$mtx[1]}+$protocol:sha1:".sha1(sha1($microid) . $hash).'\' />';
 			}
 		}
 
 		// Determine if I should add pavatar stuff
-		if (array_key_exists('pavatar', $this->profile)) {
-			$this->profile['opt_headers'][] = sprintf('<link rel="pavatar" href="%s" />', $this->profile['pavatar']);
+		if (isset($this->profile['pavatar'])) {
+			$this->optional_headers[] = "<link rel='pavatar' href='{$this->profile['pavatar']}' />";
 		}
 	}
 
 	public function run($mode='no')
 	{
 		// Decide which runmode, based on user request or default
-		$run_mode = in_array($mode, self::$known['openid_modes'])
-			? $_REQUEST['openid_mode'] : 'no';
+		$run_mode = in_array($mode, self::$known['openid_modes']) ? $mode : 'no';
 
 		// Run in the determined runmode
 		$this->debug("Run mode: $run_mode at: " . time());
@@ -196,12 +184,14 @@ class PhpMyID {
 		$this->{$run_mode . '_mode'}();
 	}
 
+	//
 	// Runmode functions
+	//
 
 	/**
 	 * Allow the user to accept trust on a URL
 	 */
-	private function accept_mode ()
+	private function accept_mode()
 	{
 		// this is a user session
 		$this->user_session();
@@ -226,16 +216,18 @@ class PhpMyID {
 		}
 
 		// if neither, offer the trust request
-		$q = strpos($this->profile['req_url'], '?') ? '&' : '?';
-		$yes = $this->profile['req_url'] . $q . 'accepted=yes';
-		$no  = $this->profile['req_url'] . $q . 'accepted=no';
+		$q = strpos($this->req_url, '?') ? '&' : '?';
+		$yes = $this->req_url . $q . 'accepted=yes';
+		$no  = $this->req_url . $q . 'accepted=no';
 
 		$this->wrap_html('The client site you are attempting to log into has requested that you trust the following URL:<br/><b>' . $_SESSION['unaccepted_url'] . '</b><br/><br/>Do you wish to continue?<br/><a href="' . $yes . '">Yes</a> | <a href="' . $no . '">No</a>');
 	}
 
-	/** * Perform an association with a consumer
+	/**
+	 * Perform an association with a consumer
 	 */
-	private function associate_mode () {
+	private function associate_mode()
+	{
 		// Validate the request
 		if (! isset($_REQUEST['openid_mode']) || $_REQUEST['openid_mode'] != 'associate') {
 			$this->error_400();
@@ -255,19 +247,19 @@ class PhpMyID {
 		$dh_modulus = (@strlen($_REQUEST['openid_dh_modulus']))
 			? long(base64_decode($_REQUEST['openid_dh_modulus']))
 			: ($session_type == 'DH-SHA1'
-				? self::$p
+				? self::P
 				: null);
 
 		$dh_gen = (@strlen($_REQUEST['openid_dh_gen']))
 			? long(base64_decode($_REQUEST['openid_dh_gen']))
 			: ($session_type == 'DH-SHA1'
-				? self::$g
+				? self::G
 				: null);
 
 		$dh_consumer_public = (@strlen($_REQUEST['openid_dh_consumer_public']))
 			? $_REQUEST['openid_dh_consumer_public']
 			: ($session_type == 'DH-SHA1'
-				? $this->error_post('dh_consumer_public was not specified')
+				? $this->post_error('dh_consumer_public was not specified')
 				: null);
 
 		$lifetime = time() + $this->profile['lifetime'];
@@ -279,7 +271,7 @@ class PhpMyID {
 		);
 
 		// If I can't handle bigmath, default to plaintext sessions
-		if (in_array($session_type, self::$known['bigmath_types']) && $this->profile['use_bigmath'] === false)
+		if (in_array($session_type, self::$known['bigmath_types']) && $this->use_bigmath === false)
 			$session_type = null;
 
 		// Add response keys based on the session type
@@ -289,7 +281,7 @@ class PhpMyID {
 				list ($assoc_handle, $shared_secret) = $this->new_assoc($lifetime);
 
 				// Compute the Diffie-Hellman stuff
-				$private_key = random($dh_modulus);
+				$private_key = $this->random($dh_modulus);
 				$public_key = bmpowmod($dh_gen, $private_key, $dh_modulus);
 				$remote_key = long(base64_decode($dh_consumer_public));
 				$ss = bmpowmod($remote_key, $private_key, $dh_modulus);
@@ -297,7 +289,7 @@ class PhpMyID {
 				$keys['assoc_handle'] = $assoc_handle;
 				$keys['session_type'] = $session_type;
 				$keys['dh_server_public'] = base64_encode(bin($public_key));
-				$keys['enc_mac_key'] = base64_encode(x_or(sha1_20(bin($ss)), $shared_secret));
+				$keys['enc_mac_key'] = base64_encode(x_or(sha1_20(bin($ss), true), $shared_secret));
 
 				break;
 
@@ -313,11 +305,11 @@ class PhpMyID {
 		$this->wrap_kv($keys);
 	}
 
-
 	/**
 	 * Perform a user authorization
 	 */
-	private function authorize_mode () {
+	private function authorize_mode()
+	{
 		// this is a user session
 		$this->user_session();
 
@@ -357,7 +349,7 @@ class PhpMyID {
 		$stale = false;
 
 		// is the user trying to log in?
-		if (! is_null($digest) && $this->profile['authorized'] === false) {
+		if (! is_null($digest) && $this->authorized === false) {
 			$this->debug('Digest headers: ' . $digest);
 			$hdr = array();
 
@@ -393,7 +385,7 @@ class PhpMyID {
 					$this->debug('User session is: ' . session_id());
 					$_SESSION['auth_username'] = $hdr['username'];
 					$_SESSION['auth_url'] = $this->profile['idp_url'];
-					$this->profile['authorized'] = true;
+					$this->authorized = true;
 
 					// return to the refresh url if they get in
 					$this->wrap_redirect($_SESSION['post_auth_url']);
@@ -417,7 +409,7 @@ class PhpMyID {
 				$this->error_get($_SESSION['cancel_auth_url'], 'Too many password failures. Double check your authorization realm. You must restart your browser to try again.');
 			}
 
-		} elseif (isset($_SESSION['uniqid']) && is_null($digest) && $this->profile['authorized'] === false) {
+		} elseif (isset($_SESSION['uniqid']) && is_null($digest) && $this->authorized === false) {
 			unset($_SESSION['uniqid']);
 			$this->error_500('Missing expected authorization header.');
 		}
@@ -433,19 +425,19 @@ class PhpMyID {
 		$this->wrap_refresh($_SESSION['cancel_auth_url'] . $q . 'openid.mode=cancel');
 	}
 
-
 	/**
 	 *  Handle a consumer's request for cancellation.
 	 */
-	private function cancel_mode () {
+	private function cancel_mode()
+	{
 		$this->wrap_html('Request cancelled.');
 	}
-
 
 	/**
 	 * Handle a consumer's request to see if the user is authenticated
 	 */
-	private function check_authentication_mode () {
+	private function check_authentication_mode()
+	{
 		// Validate the request
 		if (! isset($_REQUEST['openid_mode']) || $_REQUEST['openid_mode'] != 'check_authentication') {
 			$this->error_400();
@@ -453,15 +445,15 @@ class PhpMyID {
 
 		$assoc_handle = @strlen($_REQUEST['openid_assoc_handle'])
 			? $_REQUEST['openid_assoc_handle']
-			: $this->error_post('Missing assoc_handle');
+			: $this->post_error('Missing assoc_handle');
 
 		$sig = @strlen($_REQUEST['openid_sig'])
 			? $_REQUEST['openid_sig']
-			: $this->error_post('Missing sig');
+			: $this->post_error('Missing sig');
 
 		$signed = @strlen($_REQUEST['openid_signed'])
 			? $_REQUEST['openid_signed']
-			: $this->error_post('Missing signed');
+			: $this->post_error('Missing signed');
 
 		// Prepare the return keys
 		$keys = array(
@@ -470,7 +462,7 @@ class PhpMyID {
 
 		// Invalidate the assoc handle if we need to
 		if (@strlen($_REQUEST['openid_invalidate_handle'])) {
-			destroy_assoc_handle($_REQUEST['openid_invalidate_handle']);
+			$this->destroy_assoc_handle($_REQUEST['openid_invalidate_handle']);
 
 			$keys['invalidate_handle'] = $_REQUEST['openid_invalidate_handle'];
 		}
@@ -498,14 +490,14 @@ class PhpMyID {
 		}
 
 		// Look up the consumer's shared_secret and timeout
-		list($shared_secret, $expires) = secret($assoc_handle);
+		list($shared_secret, $expires) = $this->secret($assoc_handle);
 
 		// if I can't verify the assoc_handle, or if it's expired
 		if ($shared_secret == false || (is_numeric($expires) && $expires < time())) {
 			$keys['is_valid'] = 'false';
 
 		} else {
-			$ok = base64_encode(hmac($shared_secret, $tokens));
+			$ok = base64_encode(hash_hmac('sha1', $tokens, $shared_secret, true));
 			$keys['is_valid'] = ($sig == $ok) ? 'true' : 'false';
 		}
 
@@ -513,11 +505,11 @@ class PhpMyID {
 		$this->wrap_kv($keys);
 	}
 
-
 	/**
 	 * Handle a consumer's request to see if the end user is logged in
 	 */
-	private function checkid ( $wait ) {
+	private function checkid($wait)
+	{
 		$this->debug("checkid: wait? $wait");
 
 		// This is a user session
@@ -558,15 +550,16 @@ class PhpMyID {
 		// do the trust_root analysis
 		if ($trust_root != $return_to) {
 			// the urls are not the same, be sure return decends from trust
-			if (! url_descends($return_to, $trust_root))
-				$this->error_500('Invalid trust_root: "' . $trust_root . '"');
-
+			if (!$this->url_descends($return_to, $trust_root)) {
+				$this->post_error('Invalid trust_root');
+				exit(0);
+			}
 		}
 
 		// transfer the user to the url accept mode if they're paranoid
 		if ($wait == 1 && isset($this->profile['paranoid']) && $this->profile['paranoid'] === true && (! session_is_registered('accepted_url') || $_SESSION['accepted_url'] != $trust_root)) {
 			$_SESSION['cancel_accept_url'] = $cancel_url;
-			$_SESSION['post_accept_url'] = $this->profile['req_url'];
+			$_SESSION['post_accept_url'] = $this->req_url;
 			$_SESSION['unaccepted_url'] = $trust_root;
 
 			$this->debug('Transferring to acceptance mode.');
@@ -590,7 +583,7 @@ class PhpMyID {
 		);
 
 		// if the user is not logged in, transfer to the authorization mode
-		if ($this->profile['authorized'] === false || $identity != $_SESSION['auth_url']) {
+		if ($this->authorized === false || $identity != $_SESSION['auth_url']) {
 			// users can only be logged in to one url at a time
 			$_SESSION['auth_username'] = null;
 			$_SESSION['auth_url'] = null;
@@ -599,7 +592,7 @@ class PhpMyID {
 				unset($_SESSION['uniqid']);
 
 				$_SESSION['cancel_auth_url'] = $cancel_url;
-				$_SESSION['post_auth_url'] = $this->profile['req_url'];
+				$_SESSION['post_auth_url'] = $this->req_url;
 
 				$this->debug('Transferring to authorization mode.');
 				$this->debug('Cancel URL: ' . $_SESSION['cancel_auth_url']);
@@ -625,7 +618,7 @@ class PhpMyID {
 				$this->debug("Session expired or missing key: $expires < " . time());
 				if ($assoc_handle != null) {
 					$keys['invalidate_handle'] = $assoc_handle;
-					destroy_assoc_handle($assoc_handle);
+					$this->destroy_assoc_handle($assoc_handle);
 				}
 
 				$lifetime = time() + $this->profile['lifetime'];
@@ -654,17 +647,17 @@ class PhpMyID {
 			}
 
 			$keys['signed'] = implode(',', $fields);
-			$keys['sig'] = base64_encode(hmac($shared_secret, $tokens));
+			$keys['sig'] = base64_encode(hash_hmac('sha1', $tokens, $shared_secret, true));
 		}
 
 		$this->wrap_keyed_redirect($return_to, $keys);
 	}
 
-
 	/**
 	 * Handle a consumer's request to see if the user is already logged in
 	 */
-	private function checkid_immediate_mode () {
+	private function checkid_immediate_mode()
+	{
 		if (! isset($_REQUEST['openid_mode']) || $_REQUEST['openid_mode'] != 'checkid_immediate') {
 			$this->error_500();
 			return;
@@ -673,12 +666,12 @@ class PhpMyID {
 		$this->checkid(false);
 	}
 
-
 	/**
 	 * Handle a consumer's request to see if the user is logged in, but be willing
 	 * to wait for them to perform a login if they're not
 	 */
-	private function checkid_setup_mode () {
+	private function checkid_setup_mode()
+	{
 		if (! isset($_REQUEST['openid_mode']) || $_REQUEST['openid_mode'] != 'checkid_setup') {
 			$this->error_500();
 			return;
@@ -687,24 +680,26 @@ class PhpMyID {
 		$this->checkid(true);
 	}
 
-
 	/**
 	 * Handle errors
 	 */
-	private function error_mode () {
-		isset($_REQUEST['openid_error'])
-			? $this->wrap_html($_REQUEST['openid_error'])
-			: $this->error_500();
+	private function error_mode()
+	{
+		if (isset($_REQUEST['openid_error'])) {
+			$this->wrap_html($_REQUEST['openid_error']);
+		} else {
+			$this->error_500();
+		}
 	}
-
 
 	/**
 	 * Show a user if they are logged in or not
 	 */
-	private function id_res_mode () {
+	private function id_res_mode()
+	{
 		$this->user_session();
 
-		if ($this->profile['authorized']) {
+		if ($this->authorized) {
 			$this->wrap_html('You are logged in as ' . $_SESSION['auth_username']);
 			return;
 		}
@@ -712,14 +707,14 @@ class PhpMyID {
 		$this->wrap_html('You are not logged in');
 	}
 
-
 	/**
 	 * Allow a user to perform a static login
 	 */
-	private function login_mode () {
+	private function login_mode()
+	{
 		$this->user_session();
 
-		if ($this->profile['authorized']) {
+		if ($this->authorized) {
 			$this->id_res_mode();
 			return;
 		}
@@ -733,14 +728,14 @@ class PhpMyID {
 		$this->wrap_keyed_redirect($this->profile['idp_url'], $keys);
 	}
 
-
 	/**
 	 * Allow a user to perform a static logout
 	 */
-	private function logout_mode () {
+	private function logout_mode()
+	{
 		$this->user_session();
 
-		if (!$this->profile['authorized']) {
+		if (!$this->authorized) {
 			$this->wrap_html('You were not logged in');
 			return;
 		}
@@ -753,19 +748,19 @@ class PhpMyID {
 		$this->wrap_redirect($this->profile['idp_url']);
 	}
 
-
 	/**
 	 * The default information screen
 	 */
-	private function no_mode () {
-		$this->wrap_html('This is an OpenID server endpoint. For more information, see http://openid.net/<br/>Server: <b>' . $this->profile['idp_url'] . '</b><br/>Realm: <b>' . $this->profile['php_realm'] . '</b><br/><a href="' . $this->profile['idp_url'] . '?openid.mode=login">Login</a>' . ($this->profile['allow_test'] === true ? ' | <a href="' . $this->profile['idp_url'] . '?openid.mode=test">Test</a>' : null));
+	private function no_mode()
+	{
+		$this->wrap_html('This is an OpenID server endpoint. For more information, see http://openid.net/<br/>Server: <b>' . $this->profile['idp_url'] . '</b><br/>Realm: <b>' . $this->realm . '</b><br/><a href="' . $this->profile['idp_url'] . '?openid.mode=login">Login</a>' . ($this->profile['allow_test'] === true ? ' | <a href="' . $this->profile['idp_url'] . '?openid.mode=test">Test</a>' : null));
 	}
-
 
 	/**
 	 * Testing for setup
 	 */
-	private function test_mode () {
+	private function test_mode()
+	{
 		if ($this->profile['allow_test'] != true) {
 			$this->error_403();
 		}
@@ -819,14 +814,14 @@ class PhpMyID {
 
 		// hmac
 		$test_sig = base64_decode('/VXgHvZAOdoz/OTa5+XJXzSGhjs=');
-		$check = hmac($test_ss, $test_token);
+		$check = hash_hmac('sha1', $test_token, $test_ss, true);
 		$res['hmac'] = ($check == $test_sig)
 			? 'pass' : sprintf("fail - '%s'", base64_encode($check));
 
-		if ($this->profile['use_bigmath']) {
+		if ($this->use_bigmath) {
 			// bigmath powmod
 			$test_server_public = '102773334773637418574009974502372885384288396853657336911033649141556441102566075470916498748591002884433213640712303846640842555822818660704173387461364443541327856226098159843042567251113889701110175072389560896826887426539315893475252988846151505416694218615764823146765717947374855806613410142231092856731';
-			$check = bmpowmod(self::$g, $test_server_private, self::$p);
+			$check = bmpowmod(self::G, $test_server_private, self::P);
 			$res['bmpowmod-1'] = ($check == $test_server_public)
 				? 'pass' : sprintf("fail - '%s'", $check);
 
@@ -837,7 +832,7 @@ class PhpMyID {
 
 			// bigmath powmod 2
 			$test_client_share = '19333275433742428703546496981182797556056709274486796259858099992516081822015362253491867310832140733686713353304595602619444380387600756677924791671971324290032515367930532292542300647858206600215875069588627551090223949962823532134061941805446571307168890255137575975911397744471376862555181588554632928402';
-			$check = bmpowmod($test_client_long, $test_server_private, self::$p);
+			$check = bmpowmod($test_client_long, $test_server_private, self::P);
 			$res['bmpowmod-2'] = ($check == $test_client_share)
 				? 'pass' : sprintf("fail - '%s'", $check);
 
@@ -854,7 +849,7 @@ class PhpMyID {
 		// sha1_20
 		$test_client_mac_s1 = base64_decode('G4gQQkYM6QmAzhKbVKSBahFesPL0nL3F2MREVwEtnVRRYI0ifl9zmPklwTcvURt3QTiGBd+9Dn3ESLk5qka6IO5xnILcIoBT8nnGVPiOZvTygfuzKp4tQ2mXuIATJoa7oXRGmBWtlSdFapH5Zt6NJj4B83XF/jzZiRwdYuK4HJI=');
 		$test_client_mac_s2 = base64_decode('0Mb2t9d/HvAZyuhbARJPYdx3+v4=');
-		$check = sha1_20($test_client_mac_s1);
+		$check = sha1_20($test_client_mac_s1, true);
 		$res['sha1_20'] = ($check == $test_client_mac_s2)
 			? 'pass' : sprintf("fail - '%s'", base64_encode($check));
 
@@ -873,32 +868,34 @@ class PhpMyID {
 		}
 		$out .= "</table>";
 
-		$this->wrap_html( $out );
+		$this->wrap_html($out);
 	}
 
 
+	//
 	// Support functions
+	//
 
 	/**
 	 * Prefix the keys of an array with  'openid.'
 	 * @param array $array
 	 * @return array
 	 */
-	private function append_openid ($array) {
-		$keys = array_keys($array);
-		$vals = array_values($array);
-
-		$r = array();
-		for ($i=0; $i<sizeof($keys); $i++)
-			$r['openid.' . $keys[$i]] = $vals[$i];
-		return $r;
+	private function prefix_openid($array)
+	{
+		$new = array();
+		foreach ($array as $k => $v) {
+			$new['openid.' . $k] = $v;
+		}
+		return $new;
 	}
 
 	/**
 	 * Destroy a consumer's assoc handle
 	 * @param string $id
 	 */
-	private function destroy_assoc_handle ( $id ) {
+	private function destroy_assoc_handle($id)
+	{
 		$this->debug("Destroying session: $id");
 
 		$sid = session_id();
@@ -912,14 +909,13 @@ class PhpMyID {
 		session_start();
 	}
 
-
-
 	/**
 	 * Create a new consumer association
 	 * @param integer $expiration
 	 * @return array
 	 */
-	private function new_assoc ( $expiration ) {
+	private function new_assoc($expiration)
+	{
 		if (isset($_SESSION) && is_array($_SESSION)) {
 			$sid = session_id();
 			$dat = session_encode();
@@ -949,33 +945,36 @@ class PhpMyID {
 		return array($id, $shared_secret);
 	}
 
-
 	/**
 	 * Create a new shared secret
 	 * @return string
 	 */
-	private function new_secret () {
+	private function new_secret()
+	{
 		$r = '';
-		for($i=0; $i<20; $i++)
+		for($i=0; $i<20; $i++) {
 			$r .= chr(mt_rand(0, 255));
+		}
 
 		$this->debug("Generated new key: hash = '" . md5($r) . "', length = '" . strlen($r) . "'");
 		return $r;
 	}
-
 
 	/**
 	 * Random number generation
 	 * @param integer max
 	 * @return integer
 	 */
-	private function random ( $max ) {
-		if (strlen($max) < 4)
+	private function random($max)
+	{
+		if (strlen($max) < 4) {
 			return mt_rand(1, $max - 1);
+		}
 
 		$r = '';
-		for($i=1; $i<strlen($max) - 1; $i++)
+		for($i=1; $i<strlen($max) - 1; $i++) {
 			$r .= mt_rand(0,9);
+		}
 		$r .= mt_rand(1,9);
 
 		return $r;
@@ -986,9 +985,11 @@ class PhpMyID {
 	 * @param string $handle assoc_handle to look up
 	 * @return array (shared_secret, expiration_time)
 	 */
-	private function secret ( $handle ) {
-		if (! preg_match('/^\w+$/', $handle))
+	private function secret($handle)
+	{
+		if (!preg_match('/^\w+$/', $handle)) {
 			return array(false, 0);
+		}
 
 		if (isset($_SESSION) && is_array($_SESSION)) {
 			$sid = session_id();
@@ -1021,29 +1022,34 @@ class PhpMyID {
 		return array($secret, $expiration);
 	}
 
-
 	/**
-	 * Do an internal self check
+	 * Do an internal self-check
 	 */
-	private function self_check() {
-
-		if (!isset($this->profile) || !is_array($this->profile)) {
-			$this->error_500('No configuration found, you shouldn\'t access this file directly.');
+	private function self_check()
+	{
+		if (empty($this->profile) || !is_array($this->profile)) {
+			$this->error_500('No configuration found.');
 		}
 
-		if (version_compare(phpversion(), '4.2.0', 'lt'))
-			$this->error_500('The required minimum version of PHP is 4.2.0, you are running ' . phpversion());
+		if (version_compare(phpversion(), '4.2.0', 'lt')) {
+			$this->error_500('The minimum required version of PHP is 4.2.0, you are running ' . phpversion());
+		}
 
-		$extension_r = array('session', 'pcre');
-		foreach ($extension_r as $x) {
-			if (! extension_loaded($x))
+		$required_extensions = array('session', 'pcre');
+		foreach ($required_extensions as $x) {
+			// if the extension isn't loaded, try loading it
+			if (!extension_loaded($x)) {
 				@dl($x);
-			if (! extension_loaded($x))
+			}
+
+			// if it's still not loaded, throw an error
+			if (!extension_loaded($x)) {
 				$this->error_500("Required extension '$x' is missing.");
+			}
 		}
 
-		$extension_b = array('suhosin');
-		foreach ($extension_b as $x) {
+		$banned_extensions = array('suhosin');
+		foreach ($banned_extensions as $x) {
 			if (extension_loaded($x) && !isset($this->profile["allow_$x"]) && $this->profile["allow_$x"]) {
 				$this->error_500("phpMyID is not compatible with '$x'");
 			}
@@ -1063,23 +1069,6 @@ class PhpMyID {
 	}
 
 	/**
-	 * Look for the point of differentiation in two strings
-	 * @param string $a
-	 * @param string $b
-	 * @return int
-	 */
-	private function str_diff_at ($a, $b) {
-		if ($a == $b)
-			return -1;
-		$n = min(strlen($a), strlen($b));
-		for ($i = 0; $i < $n; $i++)
-			if ($a[$i] != $b[$i])
-				return $i;
-		return $n;
-	}
-
-
-	/**
 	 * Determine if a child URL actually decends from the parent, and that the
 	 * parent is a good URL.
 	 * THIS IS EXPERIMENTAL
@@ -1087,9 +1076,11 @@ class PhpMyID {
 	 * @param string $child
 	 * @return bool
 	 */
-	private function url_descends ( $child, $parent ) {
-		if ($child == $parent)
+	private function url_descends($child, $parent)
+	{
+		if ($child == $parent) {
 			return true;
+		}
 
 		$keys = array();
 		$parts = array();
@@ -1099,74 +1090,90 @@ class PhpMyID {
 
 		foreach (array('parent', 'child') as $name) {
 			$parts[$name] = @parse_url($$name);
-			if ($parts[$name] === false)
+			if ($parts[$name] === false) {
 				return false;
+			}
 
 			$keys[$name] = array_keys($parts[$name]);
 
-			if (array_intersect($keys[$name], $req) != $req)
+			if (array_intersect($keys[$name], $req) != $req) {
 				return false;
+			}
 
-			if (array_intersect($keys[$name], $bad) != array())
+			if (array_intersect($keys[$name], $bad) != array()) {
 				return false;
+			}
 
-			if (! preg_match('/^https?$/i', strtolower($parts[$name]['scheme'])))
+			if (!preg_match('/^https?$/i', strtolower($parts[$name]['scheme']))) {
 				return false;
+			}
 
-			if (! array_key_exists('port', $parts[$name]))
+			if (!array_key_exists('port', $parts[$name])) {
 				$parts[$name]['port'] = (strtolower($parts[$name]['scheme']) == 'https') ? 443 : 80;
+			}
 
-			if (! array_key_exists('path', $parts[$name]))
+			if (!array_key_exists('path', $parts[$name])) {
 				$parts[$name]['path'] = '/';
+			}
 		}
 
 		// port and scheme must match
-		if ($parts['parent']['scheme'] != $parts['child']['scheme'] ||
-			$parts['parent']['port'] != $parts['child']['port'])
+		if (
+			$parts['parent']['scheme'] != $parts['child']['scheme'] ||
+			$parts['parent']['port'] != $parts['child']['port']
+		) {
 			return false;
+		}
 
 		// compare the hosts by reversing the strings
 		$cr_host = strtolower(strrev($parts['child']['host']));
 		$pr_host = strtolower(strrev($parts['parent']['host']));
 
-		$break = str_diff_at($cr_host, $pr_host);
-		if ($break >= 0 && ($pr_host[$break] != '*' || substr_count(substr($pr_host, 0, $break), '.') < 2))
+		$break = str_diff_pos($cr_host, $pr_host);
+
+		if (
+			$break >= 0 && ($pr_host[$break] != '*'
+			|| substr_count(substr($pr_host, 0, $break), '.') < 2)
+		) {
 			return false;
+		}
 
 		// now compare the paths
-		$break = str_diff_at($parts['child']['path'], $parts['parent']['path']);
-		if ($break >= 0
-		   && ($break < strlen($parts['parent']['path']) && $parts['parent']['path'][$break] != '*')
-		   || ($break > strlen($parts['child']['path'])))
+		$break = str_diff_pos($parts['child']['path'], $parts['parent']['path']);
+
+		if (
+			$break >= 0
+			&& ($break < strlen($parts['parent']['path']) && $parts['parent']['path'][$break] != '*')
+			|| ($break > strlen($parts['child']['path']))
+		) {
 			return false;
+		}
 
 		return true;
 	}
 
-
 	/**
 	 * Create a user session
 	 */
-	private function user_session () {
+	private function user_session()
+	{
 		session_name('phpMyID_Server');
 		@session_start();
 
-		$this->profile['authorized'] = (isset($_SESSION['auth_username'])
-					&& $_SESSION['auth_username'] == $this->profile['auth_username'])
-				? true
-				: false;
+		$this->authorized = (isset($_SESSION['auth_username'])
+					&& $_SESSION['auth_username'] == $this->profile['auth_username']);
 
-		$this->debug('Started user session: ' . session_id() . ' Auth? ' . $this->profile['authorized']);
+		$this->debug('Started user session: ' . session_id() . ' Auth? ' . $this->authorized);
 	}
-
 
 	/**
 	 * Return HTML
 	 * @param string $message
 	 */
-	private function wrap_html ( $message ) {
-		if (!isset($this->profile['opt_headers'])) {
-			$this->profile['opt_headers'] = array();
+	private function wrap_html($message)
+	{
+		if (!isset($this->optional_headers)) {
+			$this->optional_headers = array();
 		}
 
 		header('Content-Type: text/html; charset=' . $this->charset);
@@ -1174,9 +1181,9 @@ class PhpMyID {
 	<html>
 	<head>
 	<title>phpMyID</title>
-	<link rel="openid.server" href="' . $this->profile['req_url'] . '" />
+	<link rel="openid.server" href="' . $this->req_url . '" />
 	<link rel="openid.delegate" href="' . $this->profile['idp_url'] . '" />
-	' . implode("\n", $this->profile['opt_headers']) . '
+	' . implode("\n", $this->optional_headers) . '
 	<meta name="charset" content="' . $this->charset . '" />
 	<meta name="robots" content="noindex,nofollow" />
 	</head>
@@ -1187,38 +1194,38 @@ class PhpMyID {
 	';
 	}
 
-
 	/**
 	 * Return a key-value pair in plain text
 	 * @param array $keys
 	 */
-	private function wrap_kv ( $keys ) {
+	private function wrap_kv($keys)
+	{
 		$this->debug($keys, 'Wrapped key/vals');
 		header('Content-Type: text/plain; charset=' . $this->charset);
 		foreach ($keys as $key => $value)
 			printf("%s:%s\n", $key, $value);
 	}
 
-
 	/**
 	 * Redirect, with OpenID keys
 	 * @param string $url
 	 * @param array @keys
 	 */
-	private function wrap_keyed_redirect ($url, $keys) {
-		$keys = $this->append_openid($keys);
+	private function wrap_keyed_redirect($url, $keys)
+	{
+		$keys = $this->prefix_openid($keys);
 		$this->debug($keys, 'Location keys');
 
-		$q = strpos($url, '?') ? '&' : '?';
+		$q = (strpos($url, '?') !== false) ? '&' : '?';
 		$this->wrap_redirect($url . $q . http_build_query($keys));
 	}
-
 
 	/**
 	 * Redirect the browser
 	 * @param string $url
 	 */
-	private function wrap_redirect ($url) {
+	private function wrap_redirect($url)
+	{
 		header('HTTP/1.1 302 Found');
 		header('Location: ' . $url);
 		$this->debug('Location: ' . $url);
@@ -1229,7 +1236,8 @@ class PhpMyID {
 	 * Return an HTML refresh
 	 * @param string $url
 	 */
-	private function wrap_refresh ($url) {
+	private function wrap_refresh ($url)
+	{
 		header('Content-Type: text/html; charset=' . $this->charset);
 		echo '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
 	<html>
@@ -1246,56 +1254,58 @@ class PhpMyID {
 		$this->debug('Refresh: ' . $url);
 	}
 
-
 	/**
 	 * Return an error message to the user
 	 * @param string $message
 	 */
-	private function error_400 ( $message = 'Bad Request' ) {
+	private function error_400($message='Bad Request')
+	{
 		header("HTTP/1.1 400 Bad Request");
 		$this->wrap_html($message);
 		exit(1);
 	}
 
-
 	/**
 	 * Return an error message to the user
 	 * @param string $message
 	 */
-	private function error_403 ( $message = 'Forbidden' ) {
+	private function error_403($message='Forbidden')
+	{
 		header("HTTP/1.1 403 Forbidden");
 		$this->wrap_html($message);
 		exit(1);
 	}
 
-
 	/**
 	 * Return an error message to the user
 	 * @param string $message
 	 */
-	private function error_500 ( $message = 'Internal Server Error' ) {
+	private function error_500($message='Internal Server Error')
+	{
 		header("HTTP/1.1 500 Internal Server Error");
 		$this->wrap_html($message);
 		exit(1);
 	}
 
-
 	/**
 	 * Return an error message to the consumer
 	 * @param string $message
 	 */
-	private function error_get ( $url, $message = 'Bad Request') {
+	private function error_get($url, $message='Bad Request')
+	{
 		$this->wrap_keyed_redirect($url, array('mode' => 'error', 'error' => $message));
 	}
 
-
 	/**
 	 * Return an error message to the consumer
 	 * @param string $message
 	 */
-	private function error_post ( $message = 'Bad Request' ) {
+	private function post_error($message='Bad Request')
+	{
 		header("HTTP/1.1 400 Bad Request");
-		echo 'error:' . $message;
+		header("Content-type: text/plain");
+		echo "ns:http://openid.net/signon/1.1\n";
+		echo 'error:' . $message . "\n";
 		exit(1);
 	}
 
@@ -1304,7 +1314,8 @@ class PhpMyID {
 	 * @param mixed $x
 	 * @param string $m
 	 */
-	private function debug ($x, $m = null) {
+	private function debug($x, $m = null)
+	{
 		if (!isset($this->profile['debug']) || $this->profile['debug'] === false) {
 			return true;
 		}
@@ -1341,10 +1352,12 @@ if (!function_exists('http_build_query')) {
 	 * @param array $array
 	 * @return string
 	 */
-	function http_build_query ($array) {
+	function http_build_query($array)
+	{
 		$r = array();
-		foreach ($array as $key => $val)
-			$r[] = sprintf('%s=%s', urlencode($key), urlencode($val));
+		foreach ($array as $key => $val) {
+			$r[] = urlencode($key) . '=' . urlencode($val);
+		}
 		return implode('&', $r);
 	}
 }
